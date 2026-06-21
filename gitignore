@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+progress/
+.env
+build_questions.py
+assemble.py
+q_set1.py
+q_set2.py
+q_set3.py
+q_set4.py
+ans1.json
