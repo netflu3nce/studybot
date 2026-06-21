@@ -51,7 +51,7 @@ os.makedirs(PROGRESS_DIR, exist_ok=True)
 # Only these Telegram user IDs can use the bot. Anyone else gets a polite
 # refusal. Override/extend via the ALLOWED_USER_IDS env var (comma-separated)
 # without touching code, if you ever want to add/remove someone.
-DEFAULT_ALLOWED = {7608551523, 8570392079, 7351481678}
+DEFAULT_ALLOWED = {7608551523, 8570392079, 6161301710}
 _env_ids = os.environ.get("ALLOWED_USER_IDS", "")
 if _env_ids.strip():
     DEFAULT_ALLOWED |= {int(x) for x in _env_ids.split(",") if x.strip()}
