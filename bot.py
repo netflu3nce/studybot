@@ -1,13 +1,14 @@
 """
 GST 102 Study Bot
 -----------------
-A personal Telegram quiz bot for GST 102 (Communication in English II).
+A private Telegram quiz bot for GST 102 (Communication in English II),
+shared between an allowlisted set of users.
 
 Flow:
   /start  -> serves a question with A/B/C/D inline buttons
   tap     -> "Correct!" or "Wrong, the answer is X"
   missed questions resurface after 20-50 other questions (spaced repetition)
-  progress is tracked (e.g. "12% done") and persisted to disk
+  progress is tracked (e.g. "12% done") and persisted to disk, one file per user
 
 Designed for: Render Web Service (polling) + UptimeRobot keep-alive ping.
 """
@@ -38,8 +39,23 @@ if not BOT_TOKEN:
 REQUEUE_MIN = 20
 REQUEUE_MAX = 50
 
-PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 QUESTIONS_FILE = os.environ.get("QUESTIONS_FILE", "questions.json")
+
+# Per-user progress files live here, e.g. progress/7608551523.json
+PROGRESS_DIR = os.environ.get("PROGRESS_DIR", "progress")
+os.makedirs(PROGRESS_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# Allowlist
+# ----------------------------------------------------------------------------
+# Only these Telegram user IDs can use the bot. Anyone else gets a polite
+# refusal. Override/extend via the ALLOWED_USER_IDS env var (comma-separated)
+# without touching code, if you ever want to add/remove someone.
+DEFAULT_ALLOWED = {7608551523, 8570392079, 7351481678}
+_env_ids = os.environ.get("ALLOWED_USER_IDS", "")
+if _env_ids.strip():
+    DEFAULT_ALLOWED |= {int(x) for x in _env_ids.split(",") if x.strip()}
+ALLOWED_USER_IDS = DEFAULT_ALLOWED
 
 LETTERS = "ABCDEF"
 
@@ -54,13 +70,13 @@ with open(QUESTIONS_FILE, encoding="utf-8") as f:
 QUESTIONS = {q["id"]: q for q in DATA["questions"]}
 ALL_IDS = list(QUESTIONS.keys())
 TOTAL = len(ALL_IDS)
-log.info("Loaded %d questions", TOTAL)
+log.info("Loaded %d questions. Allowlisted users: %s", TOTAL, sorted(ALLOWED_USER_IDS))
 
 # ----------------------------------------------------------------------------
-# Per-user state (single user, but keyed by chat_id so it's safe either way)
+# Per-user state, one progress file per user_id, one lock per user_id
 # ----------------------------------------------------------------------------
 # state = {
-#   chat_id: {
+#   user_id: {
 #       "queue": [ids not yet asked, shuffled],
 #       "answered_correct": set(ids),    # mastered
 #       "seen": set(ids),                # ever served
@@ -71,52 +87,62 @@ log.info("Loaded %d questions", TOTAL)
 #   }
 # }
 STATE = {}
-_lock = threading.Lock()
+
+# One lock per user_id so concurrent users never block each other, but a
+# single user's own read-modify-write+save is always atomic end to end.
+_locks_guard = threading.Lock()
+_user_locks = {}
 
 
-def _load_progress():
-    if not os.path.exists(PROGRESS_FILE):
-        return {}
+def _lock_for(user_id):
+    with _locks_guard:
+        if user_id not in _user_locks:
+            _user_locks[user_id] = threading.Lock()
+        return _user_locks[user_id]
+
+
+def _progress_path(user_id):
+    return os.path.join(PROGRESS_DIR, f"{user_id}.json")
+
+
+def _load_progress(user_id):
+    path = _progress_path(user_id)
+    if not os.path.exists(path):
+        return None
     try:
-        with open(PROGRESS_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
+        with open(path, encoding="utf-8") as f:
+            s = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {}
-    restored = {}
-    for cid, s in raw.items():
-        restored[int(cid)] = {
-            "queue": s.get("queue", []),
-            "answered_correct": set(s.get("answered_correct", [])),
-            "seen": set(s.get("seen", [])),
-            "missed": {int(k): v for k, v in s.get("missed", {}).items()},
-            "served_count": s.get("served_count", 0),
-            "current": s.get("current"),
-            "right": s.get("right", 0),
-            "wrong": s.get("wrong", 0),
-        }
-    return restored
+        return None
+    return {
+        "queue": s.get("queue", []),
+        "answered_correct": set(s.get("answered_correct", [])),
+        "seen": set(s.get("seen", [])),
+        "missed": {int(k): v for k, v in s.get("missed", {}).items()},
+        "served_count": s.get("served_count", 0),
+        "current": s.get("current"),
+        "right": s.get("right", 0),
+        "wrong": s.get("wrong", 0),
+    }
 
 
-def _save_progress():
-    serializable = {}
-    for cid, s in STATE.items():
-        serializable[str(cid)] = {
-            "queue": s["queue"],
-            "answered_correct": sorted(s["answered_correct"]),
-            "seen": sorted(s["seen"]),
-            "missed": {str(k): v for k, v in s["missed"].items()},
-            "served_count": s["served_count"],
-            "current": s["current"],
-            "right": s["right"],
-            "wrong": s["wrong"],
-        }
-    tmp = PROGRESS_FILE + ".tmp"
+def _save_progress(user_id):
+    s = STATE[user_id]
+    serializable = {
+        "queue": s["queue"],
+        "answered_correct": sorted(s["answered_correct"]),
+        "seen": sorted(s["seen"]),
+        "missed": {str(k): v for k, v in s["missed"].items()},
+        "served_count": s["served_count"],
+        "current": s["current"],
+        "right": s["right"],
+        "wrong": s["wrong"],
+    }
+    path = _progress_path(user_id)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(serializable, f)
-    os.replace(tmp, PROGRESS_FILE)
-
-
-STATE = _load_progress()
+    os.replace(tmp, path)  # atomic on the same filesystem
 
 
 def fresh_state():
@@ -134,10 +160,28 @@ def fresh_state():
     }
 
 
-def get_state(chat_id):
-    if chat_id not in STATE:
-        STATE[chat_id] = fresh_state()
-    return STATE[chat_id]
+def get_state(user_id):
+    """Get (and lazily load/create) a user's state. Caller should hold that
+    user's lock for anything beyond a quick read, since this can touch disk."""
+    if user_id not in STATE:
+        loaded = _load_progress(user_id)
+        STATE[user_id] = loaded if loaded is not None else fresh_state()
+    return STATE[user_id]
+
+
+# ----------------------------------------------------------------------------
+# Access control
+# ----------------------------------------------------------------------------
+def _is_allowed(user_id):
+    return user_id in ALLOWED_USER_IDS
+
+
+def _deny(chat_id):
+    bot.send_message(
+        chat_id,
+        "🚫 This bot is private and only available to a specific study group.\n"
+        "If you think this is a mistake, contact the bot owner."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -188,28 +232,30 @@ def progress_line(s):
     return f"📊 Progress: <b>{pct}%</b> ({mastered}/{TOTAL} mastered)"
 
 
-def send_question(chat_id):
-    s = get_state(chat_id)
-    qid = pick_next(s)
-    if qid is None:
-        bot.send_message(
-            chat_id,
-            "🎉 You've mastered every question in the bank!\n\n"
-            "Send /reset to start a fresh run, or /stats to review."
-        )
-        s["current"] = None
-        _save_progress()
-        return
+def send_question(chat_id, user_id):
+    lock = _lock_for(user_id)
+    with lock:
+        s = get_state(user_id)
+        qid = pick_next(s)
+        if qid is None:
+            bot.send_message(
+                chat_id,
+                "🎉 You've mastered every question in the bank!\n\n"
+                "Send /reset to start a fresh run, or /stats to review."
+            )
+            s["current"] = None
+            _save_progress(user_id)
+            return
 
-    q = QUESTIONS[qid]
-    s["current"] = qid
-    s["seen"].add(qid)
-    s["served_count"] += 1
+        q = QUESTIONS[qid]
+        s["current"] = qid
+        s["seen"].add(qid)
+        s["served_count"] += 1
+        header = progress_line(s)
+        body = f"<b>Q{s['served_count']}</b>  <i>({q['source']})</i>\n\n{q['question']}"
+        _save_progress(user_id)
 
-    header = progress_line(s)
-    body = f"<b>Q{s['served_count']}</b>  <i>({q['source']})</i>\n\n{q['question']}"
     bot.send_message(chat_id, f"{header}\n\n{body}", reply_markup=build_keyboard(q))
-    _save_progress()
 
 
 # ----------------------------------------------------------------------------
@@ -217,8 +263,18 @@ def send_question(chat_id):
 # ----------------------------------------------------------------------------
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
-    s = get_state(m.chat.id)
-    if s["served_count"] == 0:
+    user_id = m.from_user.id
+    if not _is_allowed(user_id):
+        _deny(m.chat.id)
+        log.info("Denied /start from uid=%s", user_id)
+        return
+
+    lock = _lock_for(user_id)
+    with lock:
+        s = get_state(user_id)
+        is_first_time = s["served_count"] == 0
+
+    if is_first_time:
         bot.send_message(
             m.chat.id,
             "👋 <b>GST 102 Study Bot</b>\n\n"
@@ -226,43 +282,72 @@ def cmd_start(m):
             "Missed questions come back later automatically.\n\n"
             "Commands: /stats  /reset  /skip"
         )
-    send_question(m.chat.id)
+    send_question(m.chat.id, user_id)
 
 
 @bot.message_handler(commands=["skip"])
 def cmd_skip(m):
-    s = get_state(m.chat.id)
-    s["current"] = None
-    send_question(m.chat.id)
+    user_id = m.from_user.id
+    if not _is_allowed(user_id):
+        _deny(m.chat.id)
+        return
+
+    lock = _lock_for(user_id)
+    with lock:
+        s = get_state(user_id)
+        s["current"] = None
+        _save_progress(user_id)
+
+    send_question(m.chat.id, user_id)
 
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(m):
-    s = get_state(m.chat.id)
-    total_ans = s["right"] + s["wrong"]
-    acc = round(s["right"] / total_ans * 100, 1) if total_ans else 0
-    msg = (
-        f"{progress_line(s)}\n\n"
-        f"✅ Correct: {s['right']}\n"
-        f"❌ Wrong: {s['wrong']}\n"
-        f"🎯 Accuracy: {acc}%\n"
-        f"🔁 Queued for review: {len(s['missed'])}\n"
-        f"📥 Remaining unseen: {len([i for i in s['queue'] if i not in s['answered_correct']])}"
-    )
+    user_id = m.from_user.id
+    if not _is_allowed(user_id):
+        _deny(m.chat.id)
+        return
+
+    lock = _lock_for(user_id)
+    with lock:
+        s = get_state(user_id)
+        total_ans = s["right"] + s["wrong"]
+        acc = round(s["right"] / total_ans * 100, 1) if total_ans else 0
+        msg = (
+            f"{progress_line(s)}\n\n"
+            f"✅ Correct: {s['right']}\n"
+            f"❌ Wrong: {s['wrong']}\n"
+            f"🎯 Accuracy: {acc}%\n"
+            f"🔁 Queued for review: {len(s['missed'])}\n"
+            f"📥 Remaining unseen: {len([i for i in s['queue'] if i not in s['answered_correct']])}"
+        )
+
     bot.send_message(m.chat.id, msg)
 
 
 @bot.message_handler(commands=["reset"])
 def cmd_reset(m):
-    STATE[m.chat.id] = fresh_state()
-    _save_progress()
+    user_id = m.from_user.id
+    if not _is_allowed(user_id):
+        _deny(m.chat.id)
+        return
+
+    lock = _lock_for(user_id)
+    with lock:
+        STATE[user_id] = fresh_state()
+        _save_progress(user_id)
+
     bot.send_message(m.chat.id, "🔄 Progress reset. Send /start to begin again.")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ans|"))
 def on_answer(c):
+    user_id = c.from_user.id
     chat_id = c.message.chat.id
-    s = get_state(chat_id)
+
+    if not _is_allowed(user_id):
+        bot.answer_callback_query(c.id, "Not authorized.")
+        return
 
     try:
         _, qid_str, chosen_str = c.data.split("|")
@@ -272,38 +357,49 @@ def on_answer(c):
         bot.answer_callback_query(c.id, "Invalid response.")
         return
 
-    # Ignore taps on stale questions (e.g. after /skip)
-    if s["current"] != qid:
-        bot.answer_callback_query(c.id, "That question is no longer active. Here's a new one 👇")
-        send_question(chat_id)
-        return
+    lock = _lock_for(user_id)
+    with lock:
+        s = get_state(user_id)
 
-    q = QUESTIONS[qid]
-    correct_idx = q["answer_index"]
-    correct_letter = LETTERS[correct_idx]
-    correct_text = q["options"][correct_idx]
-
-    with _lock:
-        if chosen == correct_idx:
-            s["right"] += 1
-            s["answered_correct"].add(qid)
-            s["missed"].pop(qid, None)
-            result = f"✅ <b>Correct!</b>  ({correct_letter}. {correct_text})"
-            bot.answer_callback_query(c.id, "Correct! ✅")
+        # Ignore taps on stale questions (e.g. after /skip, or a double-tap)
+        if s["current"] != qid:
+            bot.answer_callback_query(c.id, "That question is no longer active. Here's a new one 👇")
+            stale = True
         else:
-            s["wrong"] += 1
-            s["answered_correct"].discard(qid)
-            # schedule for review after 20-50 more questions
-            due_at = s["served_count"] + random.randint(REQUEUE_MIN, REQUEUE_MAX)
-            s["missed"][qid] = due_at
-            chosen_letter = LETTERS[chosen] if chosen < len(LETTERS) else "?"
-            result = (
-                f"❌ <b>Wrong.</b>\n"
-                f"You chose {chosen_letter}.\n"
-                f"Correct answer: <b>{correct_letter}. {correct_text}</b>\n"
-                f"<i>(will reappear later for review)</i>"
-            )
-            bot.answer_callback_query(c.id, "Wrong ❌")
+            stale = False
+            q = QUESTIONS[qid]
+            correct_idx = q["answer_index"]
+            correct_letter = LETTERS[correct_idx]
+            correct_text = q["options"][correct_idx]
+
+            if chosen == correct_idx:
+                s["right"] += 1
+                s["answered_correct"].add(qid)
+                s["missed"].pop(qid, None)
+                result = f"✅ <b>Correct!</b>  ({correct_letter}. {correct_text})"
+                bot.answer_callback_query(c.id, "Correct! ✅")
+            else:
+                s["wrong"] += 1
+                s["answered_correct"].discard(qid)
+                # schedule for review after 20-50 more questions
+                due_at = s["served_count"] + random.randint(REQUEUE_MIN, REQUEUE_MAX)
+                s["missed"][qid] = due_at
+                chosen_letter = LETTERS[chosen] if chosen < len(LETTERS) else "?"
+                result = (
+                    f"❌ <b>Wrong.</b>\n"
+                    f"You chose {chosen_letter}.\n"
+                    f"Correct answer: <b>{correct_letter}. {correct_text}</b>\n"
+                    f"<i>(will reappear later for review)</i>"
+                )
+                bot.answer_callback_query(c.id, "Wrong ❌")
+
+            s["current"] = None
+
+        _save_progress(user_id)
+
+    if stale:
+        send_question(chat_id, user_id)
+        return
 
     # Lock the answered message (remove buttons, show result)
     try:
@@ -316,9 +412,7 @@ def on_answer(c):
     except Exception as e:  # message edit can fail on rare races; not fatal
         log.warning("edit failed: %s", e)
 
-    s["current"] = None
-    _save_progress()
-    send_question(chat_id)
+    send_question(chat_id, user_id)
 
 
 # ----------------------------------------------------------------------------
