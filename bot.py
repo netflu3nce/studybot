@@ -419,6 +419,34 @@ def on_answer(c):
 # Run
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
+    import time
+    from telebot.apihelper import ApiTelegramException
+
     keep_alive()  # start Flask server so Render keeps the service alive
     log.info("Bot polling started.")
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+
+    # On Render, a redeploy can briefly leave the old instance still polling
+    # while the new one starts up. Telegram only allows one getUpdates poller
+    # per token, so the newcomer gets a 409 Conflict for a few seconds until
+    # the old instance fully exits. Retry through that instead of crashing.
+    backoff = 5
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            break  # infinity_polling returned cleanly (rare, but handle it)
+        except ApiTelegramException as e:
+            if "terminated by other getUpdates request" in str(e):
+                log.warning(
+                    "Another instance is still polling (likely an overlapping "
+                    "deploy). Retrying in %ss...", backoff
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # back off up to 60s between retries
+                continue
+            log.exception("Unexpected Telegram API error, retrying in %ss", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except Exception:
+            log.exception("Polling crashed, retrying in %ss", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
